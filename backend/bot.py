@@ -8,6 +8,7 @@ from loguru import logger
 from app.agent.confirmation import (
     assistant_requested_confirmation,
     classify_confirmation,
+    normalize_confirmation_text,
 )
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.adapters.schemas.function_schema import FunctionSchema
@@ -17,6 +18,7 @@ from pipecat.frames.frames import (
     FunctionCallResultProperties,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    LLMContextFrame,
     LLMRunFrame,
     LLMTextFrame,
 )
@@ -84,10 +86,19 @@ Your responsibilities:
 PIPECAT_TOOLS = ToolsSchema([
     FunctionSchema(
         name="check_doctor_availability",
-        description="Find available doctors and appointment slots for a speciality and date.",
+        description=(
+            "Find available doctors and appointment slots by speciality or doctor type "
+            "(for example, cardiology or cardiologist) and date."
+        ),
         properties={
-            "speciality": {"type": "string", "description": "Doctor speciality"},
-            "date": {"type": "string", "description": "Date in YYYY-MM-DD format"},
+            "speciality": {
+                "type": "string",
+                "description": "Medical speciality or doctor type, such as cardiologist",
+            },
+            "date": {
+                "type": "string",
+                "description": "YYYY-MM-DD, today, tomorrow, or day after tomorrow",
+            },
         },
         required=["speciality", "date"],
     ),
@@ -122,47 +133,51 @@ def _ensure_supported_python() -> None:
 
 
 class VoiceBookingResponseProcessor(FrameProcessor):
-    def __init__(self, context: LLMContext, booking_state: VoiceBookingSession) -> None:
+    def __init__(self, booking_state: VoiceBookingSession) -> None:
         super().__init__(name="voice-booking-confirmation")
-        self._context = context
         self._booking_state = booking_state
+        self._response_frames: list[Frame] = []
         self._response_text: list[str] = []
-        self._suppress_model_response = False
-
-    def _latest_user_message(self) -> str:
-        for message in reversed(self._context.get_messages()):
-            if message.get("role") == "user" and isinstance(message.get("content"), str):
-                return message["content"]
-        return ""
-
-    @staticmethod
-    def _format_result(result: dict) -> str:
-        start_time = datetime.fromisoformat(result["start_time"])
-        date = f"{start_time:%A}, {start_time:%B} {start_time.day}, {start_time:%Y}"
-        time = start_time.strftime("%I:%M %p").lstrip("0")
-        return (
-            f"Your appointment is confirmed with {result['doctor_name']} "
-            f"({result['speciality']}) on {date} at {time}. "
-            f"Your booking ID is {result['appointment_id']}."
-        )
-
-    def _outcome_text(self, outcome: dict) -> str:
-        if outcome.get("reply"):
-            return outcome["reply"]
-        status = outcome["status"]
-        if status == VoiceBookingStatus.REJECTED:
-            return "Okay, I haven't booked anything. What would you like to change?"
-        if status == VoiceBookingStatus.FAILED:
-            return "I couldn't complete the booking. Your details are still saved. Would you like me to try again?"
-        result = outcome.get("result")
-        if result and result.get("success"):
-            return self._format_result(result)
-        return "I couldn't confirm the booking. I haven't created an appointment."
+        self._collecting_response = False
 
     async def _push_replacement_response(self, text: str, direction: FrameDirection) -> None:
         await self.push_frame(LLMFullResponseStartFrame(), direction)
         await self.push_frame(LLMTextFrame(text=text), direction)
         await self.push_frame(LLMFullResponseEndFrame(), direction)
+
+    async def _finish_response(self, direction: FrameDirection) -> None:
+        text = "".join(self._response_text)
+        await self._booking_state.mark_readback_complete(text)
+        frames = self._response_frames
+        self._response_frames = []
+        self._response_text = []
+        self._collecting_response = False
+
+        if _is_booking_success_claim(text):
+            result = self._booking_state.result
+            if (
+                self._booking_state.status == VoiceBookingStatus.BOOKED
+                and result is not None
+                and result.get("success")
+            ):
+                replacement = _format_booking_result(result)
+            elif self._booking_state.status == VoiceBookingStatus.REJECTED:
+                replacement = "I haven't booked anything. What would you like to change?"
+            elif self._booking_state.status in {
+                VoiceBookingStatus.AWAITING_CONFIRMATION,
+                VoiceBookingStatus.FAILED,
+            }:
+                replacement = (
+                    "I haven't booked the appointment yet. Would you like me to book "
+                    "the details I read back?"
+                )
+            else:
+                replacement = "I couldn't verify a completed appointment, so I haven't made one."
+            await self._push_replacement_response(replacement, direction)
+            return
+
+        for response_frame in frames:
+            await self.push_frame(response_frame, direction)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -171,31 +186,92 @@ class VoiceBookingResponseProcessor(FrameProcessor):
             await self.push_frame(frame, direction)
             return
 
-        if self._suppress_model_response:
-            if isinstance(frame, LLMFullResponseEndFrame):
-                self._suppress_model_response = False
-                self._response_text.clear()
+        if isinstance(frame, LLMFullResponseStartFrame):
+            self._collecting_response = True
+            self._response_frames = [frame]
+            self._response_text = []
             return
 
-        if isinstance(frame, LLMFullResponseStartFrame):
-            self._response_text.clear()
+        if self._collecting_response:
+            self._response_frames.append(frame)
+            if isinstance(frame, LLMTextFrame):
+                self._response_text.append(frame.text)
+            if isinstance(frame, LLMFullResponseEndFrame):
+                await self._finish_response(direction)
+            return
+
+        await self.push_frame(frame, direction)
+
+
+def _latest_user_message(context: LLMContext) -> str:
+    for message in reversed(context.get_messages()):
+        if message.get("role") == "user" and isinstance(message.get("content"), str):
+            return message["content"]
+    return ""
+
+
+def _format_booking_result(result: dict) -> str:
+    start_time = datetime.fromisoformat(result["start_time"])
+    date = f"{start_time:%A}, {start_time:%B} {start_time.day}, {start_time:%Y}"
+    time = start_time.strftime("%I:%M %p").lstrip("0")
+    return (
+        f"Your appointment is confirmed with {result['doctor_name']} "
+        f"({result['speciality']}) on {date} at {time}. "
+        f"Your booking ID is {result['appointment_id']}."
+    )
+
+
+def _is_booking_success_claim(text: str) -> bool:
+    normalized = normalize_confirmation_text(text)
+    for match in re.finditer(r"\b(?:booked|confirmed|scheduled)\b", normalized):
+        prefix = normalized[max(0, match.start() - 40):match.start()]
+        if re.search(
+            r"\b(?:not|haven t|have not|didn t|did not|don t|do not|won t|will not)"
+            r"(?:\s+\w+){0,2}\s*$",
+            prefix,
+        ):
+            continue
+        return True
+    return False
+
+
+class VoiceBookingConfirmationGate(FrameProcessor):
+    def __init__(
+        self,
+        context: LLMContext,
+        booking_state: VoiceBookingSession,
+        llm: LLMService,
+    ) -> None:
+        super().__init__(name="voice-booking-confirmation-gate")
+        self._context = context
+        self._booking_state = booking_state
+        self._llm = llm
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, LLMContextFrame):
             outcome = await self._booking_state.handle_confirmation(
-                self._latest_user_message()
+                _latest_user_message(self._context)
             )
             if outcome is not None and outcome.get("handled"):
-                self._suppress_model_response = True
-                await self._push_replacement_response(
-                    self._outcome_text(outcome),
-                    direction,
-                )
+                result = outcome.get("result")
+                if result and result.get("success"):
+                    response = _format_booking_result(result)
+                elif outcome.get("reply"):
+                    response = outcome["reply"]
+                elif outcome["status"] == VoiceBookingStatus.REJECTED:
+                    response = "Okay, I haven't booked anything. What would you like to change?"
+                elif outcome["status"] == VoiceBookingStatus.FAILED:
+                    response = (
+                        "I couldn't complete the booking. Your details are still saved. "
+                        "Would you like me to try again?"
+                    )
+                else:
+                    response = "I couldn't confirm the booking. I haven't created an appointment."
+                await self._llm.push_frame(LLMFullResponseStartFrame())
+                await self._llm.push_frame(LLMTextFrame(text=response))
+                await self._llm.push_frame(LLMFullResponseEndFrame())
                 return
-        elif isinstance(frame, LLMTextFrame):
-            self._response_text.append(frame.text)
-        elif isinstance(frame, LLMFullResponseEndFrame):
-            await self._booking_state.mark_readback_complete(
-                "".join(self._response_text)
-            )
-            self._response_text.clear()
 
         await self.push_frame(frame, direction)
 
@@ -306,9 +382,14 @@ def register_appointment_tools(
                 patient_phone=booking.patient_phone,
             )
             if preview.get("success"):
+                staged_booking = await booking_state.stage(preview)
                 result = {
                     "success": True,
-                    "booking": await booking_state.stage(preview),
+                    "booking": {
+                        key: value
+                        for key, value in staged_booking.items()
+                        if key != "confirmation_id"
+                    },
                 }
             else:
                 result = preview
@@ -375,7 +456,8 @@ async def run_bot(runner_args: SmallWebRTCRunnerArguments):
     context = LLMContext()
     booking_state = VoiceBookingSession(book_appointment)
     register_appointment_tools(llm, context, booking_state)
-    booking_response_processor = VoiceBookingResponseProcessor(context, booking_state)
+    booking_response_processor = VoiceBookingResponseProcessor(booking_state)
+    confirmation_gate = VoiceBookingConfirmationGate(context, booking_state, llm)
     user_aggregator, assistant_aggregator = (
         LLMContextAggregatorPair(
             context,
@@ -426,6 +508,7 @@ async def run_bot(runner_args: SmallWebRTCRunnerArguments):
             input_transport,
             stt,
             user_aggregator,
+            confirmation_gate,
             llm,
             booking_response_processor,
             tts,

@@ -3,6 +3,7 @@ from datetime import date as Date, datetime, time, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from app.agent.tools import normalize_speciality_query
 from app.dependencies import get_db
 from app.models import AppointmentSlot, Doctor
 
@@ -22,8 +23,9 @@ def get_availability(
 ):
     start = datetime.combine(date, time.min)
     end = start + timedelta(days=1)
+    speciality_query = normalize_speciality_query(speciality)
     doctors = db.query(Doctor).filter(
-        Doctor.speciality.ilike(f"%{speciality.strip()}%")
+        Doctor.speciality.ilike(f"%{speciality_query}%")
     ).order_by(Doctor.name).all()
 
     results = []

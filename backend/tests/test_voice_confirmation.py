@@ -100,6 +100,9 @@ def test_voice_requires_booking_summary_before_consuming_confirmation(client):
         assert first["readback_replayed"] is True
         assert state.status == VoiceBookingStatus.AWAITING_CONFIRMATION
         assert _appointment_count(client) == 0
+        repeated_before_readback = await state.handle_confirmation("Yes, book it")
+        assert repeated_before_readback["readback_replayed"] is True
+        assert _appointment_count(client) == 0
         assert await state.mark_readback_complete(first["reply"])
         return await state.handle_confirmation("Yes")
 

@@ -1,6 +1,6 @@
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -9,23 +9,73 @@ from app.models import Appointment, AppointmentSlot, Doctor
 
 logger = logging.getLogger(__name__)
 
+_SPECIALITY_ALIASES = {
+    "cardio": "cardiology",
+    "cardiologist": "cardiology",
+    "cardiologists": "cardiology",
+    "cardiology": "cardiology",
+    "dermatologist": "dermatology",
+    "dermatologists": "dermatology",
+    "dermatology": "dermatology",
+    "neurologist": "neurology",
+    "neurologists": "neurology",
+    "neurology": "neurology",
+    "orthopaedic": "orthopedics",
+    "orthopaedics": "orthopedics",
+    "orthopedics": "orthopedics",
+    "orthopedist": "orthopedics",
+    "orthopedists": "orthopedics",
+    "orthopedic": "orthopedics",
+    "orthopaedist": "orthopedics",
+}
+
 
 def normalize_phone(phone: str) -> str | None:
     cleaned = re.sub(r"\D", "", phone)
     return cleaned if 10 <= len(cleaned) <= 15 else None
 
 
+def normalize_speciality_query(speciality: str) -> str:
+    tokens = re.findall(r"[a-z]+", speciality.casefold())
+    for token in tokens:
+        canonical = _SPECIALITY_ALIASES.get(token)
+        if canonical:
+            return canonical
+    return " ".join(tokens) or speciality.strip()
+
+
+def _parse_availability_date(value: str) -> datetime:
+    normalized = re.sub(r"\s+", " ", value.casefold().strip())
+    normalized = re.sub(r"\btommorrow\b", "tomorrow", normalized)
+    today = datetime.now().date()
+    if "day after tomorrow" in normalized:
+        requested_date = today + timedelta(days=2)
+    elif re.search(r"\btomorrow\b", normalized):
+        requested_date = today + timedelta(days=1)
+    elif re.search(r"\btoday\b", normalized):
+        requested_date = today
+    else:
+        return datetime.strptime(value.strip(), "%Y-%m-%d")
+    return datetime.combine(requested_date, time.min)
+
+
 def check_doctor_availability(speciality: str, date: str) -> dict:
     try:
-        requested_date = datetime.strptime(date, "%Y-%m-%d")
+        requested_date = _parse_availability_date(date)
     except ValueError:
-        return {"success": False, "error": "Use a valid date in YYYY-MM-DD format."}
+        return {
+            "success": False,
+            "error": "Use YYYY-MM-DD or say today, tomorrow, or the day after tomorrow.",
+        }
 
     next_day = requested_date + timedelta(days=1)
+    speciality_query = normalize_speciality_query(speciality)
+    if not speciality_query:
+        return {"success": False, "error": "Please specify a medical speciality."}
     db = SessionLocal()
     try:
         doctors = db.query(Doctor).filter(
-            Doctor.speciality.ilike(f"%{speciality.strip()}%")
+            Doctor.speciality.ilike(f"%{speciality_query}%")
         ).all()
         results = []
         for doctor in doctors:
@@ -50,7 +100,11 @@ def check_doctor_availability(speciality: str, date: str) -> dict:
                         for slot in slots
                     ],
                 })
-        return {"success": True, "date": date, "doctors": results}
+        return {
+            "success": True,
+            "date": requested_date.date().isoformat(),
+            "doctors": results,
+        }
     except SQLAlchemyError as exc:
         logger.error("Availability lookup failed (%s)", type(exc).__name__)
         return {"success": False, "error": "Availability lookup failed."}
@@ -120,6 +174,43 @@ def _booking_result(appointment: Appointment, doctor: Doctor, slot: AppointmentS
         "patient_phone": appointment.patient_phone,
         "status": appointment.status,
     }
+
+
+def lookup_appointment(appointment_id: int, patient_phone: str) -> dict:
+    patient_phone = normalize_phone(patient_phone)
+    if patient_phone is None:
+        return {"success": False, "error": "Enter a valid phone number."}
+
+    db = SessionLocal()
+    try:
+        appointment = db.query(Appointment).filter(
+            Appointment.id == appointment_id,
+            Appointment.patient_phone == patient_phone,
+            Appointment.status == "booked",
+        ).first()
+        if appointment is None:
+            return {
+                "success": False,
+                "error": "No active appointment matches those details.",
+                "code": "not_found",
+            }
+
+        doctor = db.query(Doctor).filter(Doctor.id == appointment.doctor_id).first()
+        slot = db.query(AppointmentSlot).filter(
+            AppointmentSlot.id == appointment.slot_id,
+        ).first()
+        if doctor is None or slot is None:
+            logger.error("Appointment lookup found incomplete record (id=%s).", appointment_id)
+            return {
+                "success": False,
+                "error": "Appointment details could not be loaded.",
+            }
+        return _booking_result(appointment, doctor, slot)
+    except SQLAlchemyError as exc:
+        logger.error("Appointment lookup failed (%s)", type(exc).__name__)
+        return {"success": False, "error": "Appointment details could not be loaded."}
+    finally:
+        db.close()
 
 
 def book_appointment(

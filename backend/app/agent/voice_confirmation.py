@@ -49,6 +49,10 @@ class VoiceBookingSession:
     def pending(self) -> dict | None:
         return dict(self._pending) if self._pending is not None else None
 
+    @property
+    def result(self) -> dict | None:
+        return dict(self._result) if self._result is not None else None
+
     async def stage(self, preview: dict) -> dict:
         start_time = datetime.fromisoformat(preview["start_time"])
         details = {
@@ -225,7 +229,6 @@ class VoiceBookingSession:
             if decision != "confirm":
                 return None
             if not self._readback_complete:
-                self._readback_complete = True
                 return {
                     "handled": True,
                     "status": self._status,

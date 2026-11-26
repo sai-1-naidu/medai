@@ -17,6 +17,79 @@ def test_health_and_dashboard_are_available(client):
     dashboard = client.get("/")
     assert dashboard.status_code == 200
     assert "MediVoice assistant" in dashboard.text
+    assert "appointment-lookup-form" in dashboard.text
+
+
+def test_appointment_lookup_requires_matching_id_and_phone(client):
+    availability = client.get(
+        "/doctors/availability",
+        params={"speciality": "Cardiology", "date": "2099-01-02"},
+    ).json()
+    slot = availability["doctors"][0]["available_slots"][0]
+    booking = client.post(
+        "/appointments/book",
+        json={
+            "doctor_id": 1,
+            "slot_id": slot["slot_id"],
+            "patient_phone": "15552345678",
+        },
+    ).json()
+
+    lookup = client.post(
+        "/appointments/lookup",
+        json={
+            "appointment_id": booking["appointment_id"],
+            "patient_phone": "15552345678",
+        },
+    )
+    assert lookup.status_code == 200
+    assert lookup.json()["appointment_id"] == booking["appointment_id"]
+    assert lookup.json()["doctor_name"] == "Dr. Test"
+
+    wrong_phone = client.post(
+        "/appointments/lookup",
+        json={
+            "appointment_id": booking["appointment_id"],
+            "patient_phone": "15550000000",
+        },
+    )
+    assert wrong_phone.status_code == 404
+
+    client.post(
+        f"/appointments/{booking['appointment_id']}/cancel",
+        json={"patient_phone": "15552345678"},
+    )
+    cancelled = client.post(
+        "/appointments/lookup",
+        json={
+            "appointment_id": booking["appointment_id"],
+            "patient_phone": "15552345678",
+        },
+    )
+    assert cancelled.status_code == 404
+
+
+def test_availability_accepts_doctor_title_and_spoken_relative_date(client, monkeypatch):
+    from app.agent.tools import check_doctor_availability
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2099, 1, 1, 12, 0)
+
+    monkeypatch.setattr("app.agent.tools.datetime", FixedDateTime)
+    result = check_doctor_availability("cardiologist frio", "tommorrow")
+
+    assert result["success"] is True
+    assert result["date"] == "2099-01-02"
+    assert result["doctors"][0]["doctor_name"] == "Dr. Test"
+
+    dashboard_search = client.get(
+        "/doctors/availability",
+        params={"speciality": "cardiologist", "date": "2099-01-02"},
+    )
+    assert dashboard_search.status_code == 200
+    assert dashboard_search.json()["doctors"][0]["doctor_name"] == "Dr. Test"
 
 
 def test_availability_booking_double_booking_and_cancellation(client):

@@ -52,12 +52,20 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "check_doctor_availability",
-            "description": "Find available appointments for a medical speciality on a date.",
+            "description": (
+                "Find available appointments for a medical speciality or doctor type "
+                "(for example, cardiology or cardiologist) on a date."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "speciality": {"type": "string"},
-                    "date": {"type": "string", "description": "Date in YYYY-MM-DD format"},
+                    "date": {
+                        "type": "string",
+                        "description": (
+                            "YYYY-MM-DD, today, tomorrow, or the day after tomorrow."
+                        ),
+                    },
                 },
                 "required": ["speciality", "date"],
                 "additionalProperties": False,

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from datetime import datetime
 from types import SimpleNamespace
 
 import httpx
@@ -152,13 +153,18 @@ def test_transcription_rejects_empty_and_oversized_recordings(client):
     assert oversized.status_code == 413
 
 
-def test_pipecat_voice_confirmation_routes_through_booking_service(client):
+def test_pipecat_voice_confirmation_routes_through_booking_service(client, monkeypatch):
     pytest.importorskip("pipecat")
     from app.agent.voice_confirmation import VoiceBookingSession, VoiceBookingStatus
     from app.agent.tools import book_appointment
     from app.models import Appointment
-    from bot import VoiceBookingResponseProcessor, register_appointment_tools
+    from bot import (
+        VoiceBookingConfirmationGate,
+        VoiceBookingResponseProcessor,
+        register_appointment_tools,
+    )
     from pipecat.frames.frames import (
+        LLMContextFrame,
         LLMFullResponseEndFrame,
         LLMFullResponseStartFrame,
         LLMTextFrame,
@@ -182,6 +188,13 @@ def test_pipecat_voice_confirmation_routes_through_booking_service(client):
     state = VoiceBookingSession(book_appointment)
     register_appointment_tools(llm, context, state)
 
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2099, 1, 1, 12, 0)
+
+    monkeypatch.setattr("app.agent.tools.datetime", FixedDateTime)
+
     def invoke(name, arguments):
         results = []
 
@@ -202,9 +215,11 @@ def test_pipecat_voice_confirmation_routes_through_booking_service(client):
 
     availability = invoke(
         "check_doctor_availability",
-        {"speciality": "Cardiology", "date": "2099-01-02"},
+        {"speciality": "cardiologist frio", "date": "tommorrow"},
     )
     assert availability["success"] is True
+    assert availability["date"] == "2099-01-02"
+    assert availability["doctors"][0]["speciality"] == "Cardiology"
     assert context.tools.standard_tools
 
     proposal = invoke(
@@ -221,6 +236,7 @@ def test_pipecat_voice_confirmation_routes_through_booking_service(client):
     assert proposal["booking"]["date"] == "2099-01-02"
     assert proposal["booking"]["slot_id"] == 1
     assert proposal["booking"]["patient_phone"] == "15552345678"
+    assert "confirmation_id" not in proposal["booking"]
     assert state.status == VoiceBookingStatus.AWAITING_CONFIRMATION
     assert "prepare_appointment_booking" in llm.functions
     assert "book_appointment" not in llm.functions
@@ -229,11 +245,7 @@ def test_pipecat_voice_confirmation_routes_through_booking_service(client):
     assert db.query(Appointment).count() == 0
     db.close()
 
-    async def arm_readback():
-        return await state.mark_readback_complete(proposal["booking"]["summary"])
-
-    assert asyncio.run(arm_readback()) is True
-    response_processor = VoiceBookingResponseProcessor(context, state)
+    response_processor = VoiceBookingResponseProcessor(state)
     forwarded_frames = []
 
     async def capture_frame(frame, direction=FrameDirection.DOWNSTREAM):
@@ -244,52 +256,70 @@ def test_pipecat_voice_confirmation_routes_through_booking_service(client):
         "role": "assistant",
         "content": proposal["booking"]["summary"],
     })
+    asyncio.run(response_processor.process_frame(
+        LLMFullResponseStartFrame(),
+        FrameDirection.DOWNSTREAM,
+    ))
+    asyncio.run(response_processor.process_frame(
+        LLMTextFrame(text=proposal["booking"]["summary"]),
+        FrameDirection.DOWNSTREAM,
+    ))
+    asyncio.run(response_processor.process_frame(
+        LLMFullResponseEndFrame(),
+        FrameDirection.DOWNSTREAM,
+    ))
+
+    gate = VoiceBookingConfirmationGate(context, state, llm)
+    gate_forwarded_frames = []
+
+    async def capture_gate_frame(frame, direction=FrameDirection.DOWNSTREAM):
+        gate_forwarded_frames.append(frame)
+
+    gate.push_frame = capture_gate_frame
     context.add_message({"role": "user", "content": "Where?"})
-    asyncio.run(
-        response_processor.process_frame(
-            LLMFullResponseStartFrame(),
-            FrameDirection.DOWNSTREAM,
-        )
-    )
+    asyncio.run(gate.process_frame(
+        LLMContextFrame(context),
+        FrameDirection.DOWNSTREAM,
+    ))
     assert state.status == VoiceBookingStatus.AWAITING_CONFIRMATION
-    assert any(isinstance(frame, LLMFullResponseStartFrame) for frame in forwarded_frames)
+    assert any(isinstance(frame, LLMContextFrame) for frame in gate_forwarded_frames)
     db = client.app.state.test_session()
     assert db.query(Appointment).count() == 0
     db.close()
 
     context.add_message({"role": "user", "content": "Yes, book it. Where?"})
-    asyncio.run(
-        response_processor.process_frame(
-            LLMFullResponseStartFrame(),
-            FrameDirection.DOWNSTREAM,
-        )
-    )
-    asyncio.run(
-        response_processor.process_frame(
-            LLMTextFrame(text="Please confirm by replying with exactly yes book it."),
-            FrameDirection.DOWNSTREAM,
-        )
-    )
-    asyncio.run(
-        response_processor.process_frame(
-            LLMFullResponseEndFrame(),
-            FrameDirection.DOWNSTREAM,
-        )
-    )
+    llm.frames.clear()
+    asyncio.run(gate.process_frame(
+        LLMContextFrame(context),
+        FrameDirection.DOWNSTREAM,
+    ))
 
     assert state.status == VoiceBookingStatus.BOOKED
+    assert len(llm.frames) == 3
+    async def send_direct_confirmation_response():
+        for frame in llm.frames:
+            await response_processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+    asyncio.run(send_direct_confirmation_response())
     assert any(
         isinstance(frame, LLMTextFrame) and "Your booking ID is" in frame.text
-        for frame in forwarded_frames
-    )
-    assert all(
-        not isinstance(frame, LLMTextFrame)
-        or "exactly yes book it" not in frame.text
         for frame in forwarded_frames
     )
     db = client.app.state.test_session()
     booking = db.query(Appointment).one()
     appointment_id = booking.id
+    db.close()
+
+    context.add_message({"role": "user", "content": "Absolutely."})
+    llm.frames.clear()
+    asyncio.run(gate.process_frame(
+        LLMContextFrame(context),
+        FrameDirection.DOWNSTREAM,
+    ))
+    assert state.status == VoiceBookingStatus.BOOKED
+    assert len(llm.frames) == 3
+    db = client.app.state.test_session()
+    assert db.query(Appointment).count() == 1
     db.close()
 
     cancellation_arguments = {
@@ -307,3 +337,40 @@ def test_pipecat_voice_confirmation_routes_through_booking_service(client):
     cancellation = invoke("cancel_appointment", cancellation_arguments)
     assert cancellation["success"] is True
     assert cancellation["status"] == "cancelled"
+
+
+def test_voice_output_does_not_claim_an_unrecorded_booking():
+    pytest.importorskip("pipecat")
+    from app.agent.voice_confirmation import VoiceBookingSession
+    from bot import VoiceBookingResponseProcessor
+    from pipecat.frames.frames import (
+        LLMFullResponseEndFrame,
+        LLMFullResponseStartFrame,
+        LLMTextFrame,
+    )
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    from pipecat.processors.frame_processor import FrameDirection
+
+    state = VoiceBookingSession(lambda **_: {"success": False})
+    processor = VoiceBookingResponseProcessor(state)
+    output_frames = []
+
+    async def capture_frame(frame, direction=FrameDirection.DOWNSTREAM):
+        output_frames.append(frame)
+
+    processor.push_frame = capture_frame
+
+    async def send_false_success():
+        await processor.process_frame(LLMFullResponseStartFrame(), FrameDirection.DOWNSTREAM)
+        await processor.process_frame(
+            LLMTextFrame(text="Your appointment is booked. Your confirmation ID is random."),
+            FrameDirection.DOWNSTREAM,
+        )
+        await processor.process_frame(LLMFullResponseEndFrame(), FrameDirection.DOWNSTREAM)
+
+    asyncio.run(send_false_success())
+    visible_text = "".join(
+        frame.text for frame in output_frames if isinstance(frame, LLMTextFrame)
+    )
+    assert "couldn't verify a completed appointment" in visible_text
+    assert "random" not in visible_text

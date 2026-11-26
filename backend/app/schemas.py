@@ -31,6 +31,16 @@ class CancellationRequest(BaseModel):
         return normalize_phone(value)
 
 
+class AppointmentLookupRequest(BaseModel):
+    appointment_id: int = Field(gt=0)
+    patient_phone: str
+
+    @field_validator("patient_phone")
+    @classmethod
+    def validate_phone(cls, value: str) -> str:
+        return normalize_phone(value)
+
+
 class CancellationToolRequest(BaseModel):
     appointment_id: int = Field(gt=0)
     patient_phone: str

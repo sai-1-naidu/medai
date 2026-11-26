@@ -1,8 +1,13 @@
 from fastapi import APIRouter, HTTPException
 
 from app.agent.tools import book_appointment as create_appointment
+from app.agent.tools import lookup_appointment
 from app.agent.tools import cancel_appointment as cancel_patient_appointment
-from app.schemas import BookingRequest, CancellationRequest
+from app.schemas import (
+    AppointmentLookupRequest,
+    BookingRequest,
+    CancellationRequest,
+)
 
 router = APIRouter(prefix="/appointments", tags=["appointments"])
 
@@ -21,6 +26,17 @@ def book_appointment(request: BookingRequest):
     result = create_appointment(
         doctor_id=request.doctor_id,
         slot_id=request.slot_id,
+        patient_phone=request.patient_phone,
+    )
+    if not result["success"]:
+        raise_result_error(result)
+    return result
+
+
+@router.post("/lookup")
+def appointment_lookup(request: AppointmentLookupRequest):
+    result = lookup_appointment(
+        appointment_id=request.appointment_id,
         patient_phone=request.patient_phone,
     )
     if not result["success"]:
