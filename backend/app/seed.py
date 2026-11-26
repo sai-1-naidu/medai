@@ -1,128 +1,65 @@
 from datetime import datetime, timedelta
 
-from app.database import SessionLocal, Base, engine
-from app import models
-from app.models import Doctor, AppointmentSlot
+from app.database import Base, SessionLocal, engine
+from app.models import AppointmentSlot, Doctor
 
 
-# --------------------------------------------------
-# 1. Create database tables if they don't exist
-# --------------------------------------------------
+def seed_database() -> None:
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        doctors = db.query(Doctor).order_by(Doctor.id).all()
+        if not doctors:
+            doctors = [
+                Doctor(name="Dr. Ananya Rao", speciality="Cardiology", consultation_minutes=30),
+                Doctor(name="Dr. Rahul Sharma", speciality="Dermatology", consultation_minutes=20),
+                Doctor(name="Dr. Priya Reddy", speciality="Neurology", consultation_minutes=30),
+                Doctor(name="Dr. Arjun Kumar", speciality="Orthopedics", consultation_minutes=30),
+            ]
+            db.add_all(doctors)
+            db.flush()
 
-Base.metadata.create_all(bind=engine)
-
-
-# --------------------------------------------------
-# 2. Create database session
-# --------------------------------------------------
-
-db = SessionLocal()
-
-
-try:
-    # --------------------------------------------------
-    # 3. Seed only when the doctors table is empty
-    # --------------------------------------------------
-
-    if db.query(Doctor).count() == 0:
-
-        doctors = [
-            Doctor(
-                name="Dr. Ananya Rao",
-                speciality="Cardiology",
-                consultation_minutes=30
-            ),
-            Doctor(
-                name="Dr. Rahul Sharma",
-                speciality="Dermatology",
-                consultation_minutes=20
-            ),
-            Doctor(
-                name="Dr. Priya Reddy",
-                speciality="Neurology",
-                consultation_minutes=30
-            ),
-            Doctor(
-                name="Dr. Arjun Kumar",
-                speciality="Orthopedics",
-                consultation_minutes=30
-            ),
-        ]
-
-        # Insert doctors into database
-        db.add_all(doctors)
-        db.commit()
-
-        # Fetch doctors again to get their database IDs
-        doctors = db.query(Doctor).all()
-
-        # --------------------------------------------------
-        # 4. Generate appointment slots for the next 3 days
-        # --------------------------------------------------
-
-        today = datetime.now().replace(
+        first_day = datetime.now().replace(
             hour=0,
             minute=0,
             second=0,
-            microsecond=0
-        )
+            microsecond=0,
+        ) + timedelta(days=1)
+        last_day = first_day + timedelta(days=7)
+        existing_slots = db.query(
+            AppointmentSlot.doctor_id,
+            AppointmentSlot.start_time,
+        ).filter(
+            AppointmentSlot.start_time >= first_day,
+            AppointmentSlot.start_time < last_day,
+        ).all()
+        existing_keys = {(doctor_id, start_time) for doctor_id, start_time in existing_slots}
 
         slots = []
-
         for doctor in doctors:
-
-            # Generate slots for the next 3 days
-            for day in range(1, 4):
-
-                date = today + timedelta(days=day)
-
-                # Available appointment start times
-                for hour in [9, 10, 11, 14, 15, 16]:
-
-                    start_time = date.replace(
-                        hour=hour,
-                        minute=0
+            for day in range(7):
+                appointment_date = first_day + timedelta(days=day)
+                for hour in (9, 10, 11, 14, 15, 16):
+                    start_time = appointment_date.replace(hour=hour)
+                    if (doctor.id, start_time) in existing_keys:
+                        continue
+                    slots.append(
+                        AppointmentSlot(
+                            doctor_id=doctor.id,
+                            start_time=start_time,
+                            end_time=start_time + timedelta(minutes=doctor.consultation_minutes),
+                            is_booked=False,
+                        )
                     )
 
-                    end_time = start_time + timedelta(
-                        minutes=doctor.consultation_minutes
-                    )
-
-                    slot = AppointmentSlot(
-                        doctor_id=doctor.id,
-                        start_time=start_time,
-                        end_time=end_time,
-                        is_booked=False
-                    )
-
-                    slots.append(slot)
-
-        # Insert all appointment slots into database
         db.add_all(slots)
         db.commit()
-
-        print("Sample doctors and slots created successfully!")
-
-    else:
-
-        print("Seed data already exists. Skipping.")
-
-
-# --------------------------------------------------
-# 5. Handle errors
-# --------------------------------------------------
-
-except Exception as e:
-
-    db.rollback()
-
-    print("Error while seeding database:", e)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
-# --------------------------------------------------
-# 6. Always close database session
-# --------------------------------------------------
-
-finally:
-
-    db.close()
+if __name__ == "__main__":
+    seed_database()

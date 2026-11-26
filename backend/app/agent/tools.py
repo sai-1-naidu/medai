@@ -1,46 +1,41 @@
+import logging
+import re
 from datetime import datetime, timedelta
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from app.database import SessionLocal
-from app.models import Doctor, AppointmentSlot, Appointment
+from app.models import Appointment, AppointmentSlot, Doctor
+
+logger = logging.getLogger(__name__)
 
 
-import re
+def normalize_phone(phone: str) -> str | None:
+    cleaned = re.sub(r"\D", "", phone)
+    return cleaned if 10 <= len(cleaned) <= 15 else None
 
-def normalize_phone(phone:str) -> str | None :
-    cleaned = re.sub(r"\D", "", phone
-    )
-    if not (10 <= len(cleaned) <= 15):
-        return None
-    return cleaned
 
-def check_doctor_availability(speciality: str, date: str):
-    """
-    Find doctors of a speciality and their available slots
-    on a requested date.
-    """
-
-    db = SessionLocal()
-
+def check_doctor_availability(speciality: str, date: str) -> dict:
     try:
         requested_date = datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        return {"success": False, "error": "Use a valid date in YYYY-MM-DD format."}
 
-        next_day = requested_date + timedelta(days=1)
-
+    next_day = requested_date + timedelta(days=1)
+    db = SessionLocal()
+    try:
         doctors = db.query(Doctor).filter(
-            Doctor.speciality.ilike(speciality)
+            Doctor.speciality.ilike(f"%{speciality.strip()}%")
         ).all()
-
         results = []
-
         for doctor in doctors:
-
             slots = db.query(AppointmentSlot).filter(
                 AppointmentSlot.doctor_id == doctor.id,
                 AppointmentSlot.start_time >= requested_date,
+                AppointmentSlot.start_time >= datetime.now(),
                 AppointmentSlot.start_time < next_day,
-                AppointmentSlot.is_booked == False
+                AppointmentSlot.is_booked.is_(False),
             ).order_by(AppointmentSlot.start_time).all()
-
             if slots:
                 results.append({
                     "doctor_id": doctor.id,
@@ -50,178 +45,301 @@ def check_doctor_availability(speciality: str, date: str):
                         {
                             "slot_id": slot.id,
                             "start_time": slot.start_time.isoformat(),
-                            "end_time": slot.end_time.isoformat()
+                            "end_time": slot.end_time.isoformat(),
                         }
                         for slot in slots
-                    ]
+                    ],
                 })
-
-        return {
-            "success": True,
-            "date": date,
-            "doctors": results
-        }
-
-    except ValueError:
-        return {
-            "success": False,
-            "error": "Invalid date format. Use YYYY-MM-DD."
-        }
-
-    except Exception as e:
-        return {
-            "success": False,
-            "error": "Unable to check availability."
-        }
-
+        return {"success": True, "date": date, "doctors": results}
+    except SQLAlchemyError as exc:
+        logger.error("Availability lookup failed (%s)", type(exc).__name__)
+        return {"success": False, "error": "Availability lookup failed."}
     finally:
         db.close()
 
-from app.models import Appointment
+
+def prepare_appointment_booking(
+    doctor_id: int,
+    slot_id: int,
+    patient_phone: str,
+) -> dict:
+    patient_phone = normalize_phone(patient_phone)
+    if patient_phone is None:
+        return {
+            "success": False,
+            "error": "Enter a valid phone number.",
+            "code": "invalid_phone",
+        }
+
+    db = SessionLocal()
+    try:
+        doctor = db.query(Doctor).filter(Doctor.id == doctor_id).first()
+        if doctor is None:
+            return {"success": False, "error": "Doctor not found.", "code": "not_found"}
+
+        slot = db.query(AppointmentSlot).filter(
+            AppointmentSlot.id == slot_id,
+            AppointmentSlot.doctor_id == doctor_id,
+        ).first()
+        if slot is None:
+            return {"success": False, "error": "Appointment slot not found.", "code": "not_found"}
+        if slot.is_booked or slot.start_time < datetime.now():
+            return {
+                "success": False,
+                "error": "This appointment slot is no longer available.",
+                "code": "unavailable",
+            }
+
+        return {
+            "success": True,
+            "doctor_id": doctor.id,
+            "doctor_name": doctor.name,
+            "speciality": doctor.speciality,
+            "slot_id": slot.id,
+            "start_time": slot.start_time.isoformat(),
+            "end_time": slot.end_time.isoformat(),
+            "patient_phone": patient_phone,
+        }
+    except SQLAlchemyError as exc:
+        logger.error("Appointment confirmation preview failed (%s)", type(exc).__name__)
+        return {"success": False, "error": "Booking details could not be verified."}
+    finally:
+        db.close()
+
+
+def _booking_result(appointment: Appointment, doctor: Doctor, slot: AppointmentSlot) -> dict:
+    return {
+        "success": True,
+        "message": "Appointment booked successfully.",
+        "appointment_id": appointment.id,
+        "doctor_name": doctor.name,
+        "speciality": doctor.speciality,
+        "slot_id": slot.id,
+        "start_time": slot.start_time.isoformat(),
+        "end_time": slot.end_time.isoformat(),
+        "patient_phone": appointment.patient_phone,
+        "status": appointment.status,
+    }
 
 
 def book_appointment(
     doctor_id: int,
     slot_id: int,
-    patient_phone: str
-):
-    """
-    Book a doctor's appointment for a patient.
-    """
+    patient_phone: str,
+    *,
+    idempotent: bool = False,
+) -> dict:
     patient_phone = normalize_phone(patient_phone)
     if patient_phone is None:
-        return {
-            "success": False,
-            "error": "Invalid phone number format."
-        }
-    db = SessionLocal()
+        return {"success": False, "error": "Enter a valid phone number."}
 
+    db = SessionLocal()
     try:
-        # Claim the slot only if it is still available.
-        result = db.query(AppointmentSlot).filter(
+        doctor = db.query(Doctor).filter(Doctor.id == doctor_id).first()
+        if doctor is None:
+            return {"success": False, "error": "Doctor not found.", "code": "not_found"}
+
+        if idempotent:
+            existing = db.query(Appointment).filter(
+                Appointment.slot_id == slot_id,
+                Appointment.doctor_id == doctor_id,
+                Appointment.patient_phone == patient_phone,
+                Appointment.status == "booked",
+            ).first()
+            if existing is not None:
+                slot = db.query(AppointmentSlot).filter(
+                    AppointmentSlot.id == existing.slot_id,
+                ).first()
+                if slot is not None:
+                    return _booking_result(existing, doctor, slot)
+
+        claimed = db.query(AppointmentSlot).filter(
             AppointmentSlot.id == slot_id,
             AppointmentSlot.doctor_id == doctor_id,
-            AppointmentSlot.is_booked == False
+            AppointmentSlot.is_booked.is_(False),
+            AppointmentSlot.start_time >= datetime.now(),
         ).update(
             {AppointmentSlot.is_booked: True},
-            synchronize_session=False
+            synchronize_session=False,
         )
-
-        if result == 0:
+        if claimed != 1:
             db.rollback()
-
+            if idempotent:
+                existing = db.query(Appointment).filter(
+                    Appointment.slot_id == slot_id,
+                    Appointment.doctor_id == doctor_id,
+                    Appointment.patient_phone == patient_phone,
+                    Appointment.status == "booked",
+                ).first()
+                if existing is not None:
+                    slot = db.query(AppointmentSlot).filter(
+                        AppointmentSlot.id == existing.slot_id,
+                    ).first()
+                    if slot is not None:
+                        return _booking_result(existing, doctor, slot)
             return {
                 "success": False,
-                "error": "This appointment slot is no longer available."
+                "error": "This appointment slot is no longer available.",
+                "code": "unavailable",
             }
 
+        slot = db.query(AppointmentSlot).filter(AppointmentSlot.id == slot_id).first()
         appointment = Appointment(
             doctor_id=doctor_id,
             slot_id=slot_id,
             patient_phone=patient_phone,
-            status="booked"
+            status="booked",
         )
-
         db.add(appointment)
         db.commit()
         db.refresh(appointment)
-
-        doctor = db.query(Doctor).filter(
-            Doctor.id == doctor_id
-        ).first()
-
-        slot = db.query(AppointmentSlot).filter(
-            AppointmentSlot.id == slot_id
-        ).first()
-
-        return {
-            "success": True,
-            "message": "Appointment booked successfully.",
-            "appointment_id": appointment.id,
-            "doctor_name": doctor.name,
-            "speciality": doctor.speciality,
-            "start_time": slot.start_time.isoformat(),
-            "end_time": slot.end_time.isoformat(),
-            "patient_phone": patient_phone
-        }
-
-    except Exception:
+        return _booking_result(appointment, doctor, slot)
+    except SQLAlchemyError as exc:
         db.rollback()
-
-        return {
-            "success": False,
-            "error": "Booking failed. Please try again."
-        }
-
+        logger.error("Appointment booking failed (%s)", type(exc).__name__)
+        return {"success": False, "error": "Booking failed. Please try again."}
     finally:
         db.close()
 
 
 def cancel_appointment(
     appointment_id: int,
-    patient_phone: str
-):
-    """
-    Cancel an appointment after verifying the patient's phone number.
-    """
+    patient_phone: str,
+    *,
+    idempotent: bool = False,
+) -> dict:
     patient_phone = normalize_phone(patient_phone)
     if patient_phone is None:
-        return {
-                "success": False,
-                "error": "Invalid phone number format."
-            }
-    db = SessionLocal()
+        return {"success": False, "error": "Enter a valid phone number."}
 
+    db = SessionLocal()
     try:
         appointment = db.query(Appointment).filter(
             Appointment.id == appointment_id
         ).first()
-
-        if not appointment:
-            return {
-                "success": False,
-                "error": "Appointment not found."
-            }
-
-        # Verify the patient's phone number
+        if appointment is None:
+            return {"success": False, "error": "Appointment not found.", "code": "not_found"}
         if appointment.patient_phone != patient_phone:
             return {
                 "success": False,
-                "error": "Phone number does not match this appointment."
+                "error": "Phone number does not match this appointment.",
+                "code": "forbidden",
             }
-
-        # Prevent cancelling an already-cancelled appointment
         if appointment.status != "booked":
+            if idempotent and appointment.status == "cancelled":
+                return {
+                    "success": True,
+                    "message": "Appointment cancelled successfully.",
+                    "appointment_id": appointment_id,
+                    "status": "cancelled",
+                }
             return {
                 "success": False,
-                "error": "Appointment is already cancelled."
+                "error": "Appointment is already cancelled.",
+                "code": "unavailable",
             }
 
-        slot = db.query(AppointmentSlot).filter(
+        updated = db.query(Appointment).filter(
+            Appointment.id == appointment_id,
+            Appointment.patient_phone == patient_phone,
+            Appointment.status == "booked",
+        ).update(
+            {Appointment.status: "cancelled"},
+            synchronize_session=False,
+        )
+        if updated != 1:
+            db.rollback()
+            if idempotent:
+                existing = db.query(Appointment).filter(
+                    Appointment.id == appointment_id,
+                    Appointment.patient_phone == patient_phone,
+                    Appointment.status == "cancelled",
+                ).first()
+                if existing is not None:
+                    return {
+                        "success": True,
+                        "message": "Appointment cancelled successfully.",
+                        "appointment_id": appointment_id,
+                        "status": "cancelled",
+                    }
+            return {
+                "success": False,
+                "error": "Appointment is already cancelled.",
+                "code": "unavailable",
+            }
+
+        db.query(AppointmentSlot).filter(
             AppointmentSlot.id == appointment.slot_id
-        ).first()
-
-        appointment.status = "cancelled"
-
-        if slot:
-            slot.is_booked = False
-
+        ).update(
+            {AppointmentSlot.is_booked: False},
+            synchronize_session=False,
+        )
         db.commit()
-
         return {
             "success": True,
             "message": "Appointment cancelled successfully.",
-            "appointment_id": appointment.id,
-            "status": appointment.status
+            "appointment_id": appointment_id,
+            "status": "cancelled",
         }
-
-    except Exception:
+    except SQLAlchemyError as exc:
         db.rollback()
+        logger.error("Appointment cancellation failed (%s)", type(exc).__name__)
+        return {"success": False, "error": "Cancellation failed. Please try again."}
+    finally:
+        db.close()
 
+
+def prepare_appointment_cancellation(
+    appointment_id: int,
+    patient_phone: str,
+) -> dict:
+    patient_phone = normalize_phone(patient_phone)
+    if patient_phone is None:
         return {
             "success": False,
-            "error": "Cancellation failed. Please try again."
+            "error": "Enter a valid phone number.",
+            "code": "invalid_phone",
         }
 
+    db = SessionLocal()
+    try:
+        appointment = db.query(Appointment).filter(
+            Appointment.id == appointment_id
+        ).first()
+        if appointment is None:
+            return {"success": False, "error": "Appointment not found.", "code": "not_found"}
+        if appointment.patient_phone != patient_phone:
+            return {
+                "success": False,
+                "error": "Phone number does not match this appointment.",
+                "code": "forbidden",
+            }
+        if appointment.status != "booked":
+            return {
+                "success": False,
+                "error": "Appointment is already cancelled.",
+                "code": "unavailable",
+            }
+
+        doctor = db.query(Doctor).filter(Doctor.id == appointment.doctor_id).first()
+        slot = db.query(AppointmentSlot).filter(
+            AppointmentSlot.id == appointment.slot_id
+        ).first()
+        if doctor is None or slot is None:
+            return {"success": False, "error": "Appointment details could not be verified."}
+
+        return {
+            "success": True,
+            "appointment_id": appointment.id,
+            "doctor_name": doctor.name,
+            "speciality": doctor.speciality,
+            "slot_id": slot.id,
+            "start_time": slot.start_time.isoformat(),
+            "end_time": slot.end_time.isoformat(),
+            "patient_phone": patient_phone,
+        }
+    except SQLAlchemyError as exc:
+        logger.error("Appointment cancellation preview failed (%s)", type(exc).__name__)
+        return {"success": False, "error": "Cancellation details could not be verified."}
     finally:
         db.close()

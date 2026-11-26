@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import (
     Column,
@@ -11,6 +11,10 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 
 from app.database import Base
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class Doctor(Base):
@@ -46,7 +50,7 @@ class Appointment(Base):
     slot_id = Column(Integer, ForeignKey("appointment_slots.id"), nullable=False)
     patient_phone = Column(String, nullable=False, index=True)
     status = Column(String, default="booked")
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
     doctor = relationship("Doctor", back_populates="appointments")
     slot = relationship("AppointmentSlot", back_populates="appointment")

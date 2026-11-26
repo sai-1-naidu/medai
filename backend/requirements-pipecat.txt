@@ -1,0 +1,4 @@
+# Pipecat's WebRTC runner requires Python 3.11 or newer.
+-r requirements.txt
+pipecat-ai[webrtc,groq,elevenlabs,silero]==0.0.108
+pipecat-ai-small-webrtc-prebuilt==2.5.0
